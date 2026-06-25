@@ -600,6 +600,43 @@ func TestLabeler_handlePodEvent(t *testing.T) {
 			expectedDCGMLabel:   "",
 			expectedDriverLabel: "",
 		},
+		{
+			name: "DCGM pod not deployed if bootstrap not completed ",
+			pod:  nil,
+			existingPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "driver-installer-pod",
+						Labels: map[string]string{"k8s-app": "nvidia-driver-installer"},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "test-node",
+						Containers: []corev1.Container{
+							{
+								Name:  "dcgm",
+								Image: "nvcr.io/nvidia/driver:550.x",
+							},
+						},
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+						},
+					},
+				},
+			},
+			existingNode: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Labels: map[string]string{
+						DriverInstalledLabel: "true",
+					},
+				},
+			},
+			expectedDCGMLabel:   "",
+			expectedDriverLabel: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -713,6 +750,198 @@ func TestLabeler_handlePodEvent(t *testing.T) {
 
 				return true
 			}, timeout, poll, "failed waiting for node label to be applied")
+		})
+	}
+}
+
+func TestDCGMBootstrapCompleted(t *testing.T) {
+	tests := []struct {
+		name                         string
+		requireDCGMReadyForBootstrap bool
+		dcgmPodReady                 bool
+		existingBootstrapAnnotation  string
+		existingDCGMVersionLabel     string
+		deletePodAfterLabelSet       bool
+		expectedDCGMLabel            string
+		expectedBootstrapAnnotation  string
+	}{
+		{
+			name:                         "not deployed if bootstrap not completed and DCGM not ready",
+			requireDCGMReadyForBootstrap: true,
+			dcgmPodReady:                 false,
+			existingBootstrapAnnotation:  "",
+			existingDCGMVersionLabel:     "",
+			deletePodAfterLabelSet:       false,
+			expectedDCGMLabel:            "",
+			expectedBootstrapAnnotation:  "",
+		},
+		{
+			name:                         "deployed if requireDCGMReadyForBootstrap false, bootstrap not completed, DCGM not ready",
+			requireDCGMReadyForBootstrap: false,
+			dcgmPodReady:                 false,
+			existingBootstrapAnnotation:  "",
+			existingDCGMVersionLabel:     "",
+			deletePodAfterLabelSet:       false,
+			expectedDCGMLabel:            "4.x",
+			expectedBootstrapAnnotation:  "true",
+		},
+		{
+			name:                         "deployed if bootstrap not completed and DCGM ready",
+			requireDCGMReadyForBootstrap: true,
+			dcgmPodReady:                 true,
+			existingBootstrapAnnotation:  "",
+			existingDCGMVersionLabel:     "",
+			deletePodAfterLabelSet:       false,
+			expectedDCGMLabel:            "4.x",
+			expectedBootstrapAnnotation:  "true",
+		},
+		{
+			name:                         "deployed if bootstrap completed and DCGM not ready",
+			requireDCGMReadyForBootstrap: true,
+			dcgmPodReady:                 false,
+			existingBootstrapAnnotation:  "true",
+			existingDCGMVersionLabel:     "",
+			deletePodAfterLabelSet:       false,
+			expectedDCGMLabel:            "4.x",
+			expectedBootstrapAnnotation:  "true",
+		},
+		{
+			name:                         "annotation added when label already set, bootstrap not completed, DCGM ready",
+			requireDCGMReadyForBootstrap: true,
+			dcgmPodReady:                 true,
+			existingBootstrapAnnotation:  "",
+			existingDCGMVersionLabel:     "4.x",
+			deletePodAfterLabelSet:       false,
+			expectedDCGMLabel:            "4.x",
+			expectedBootstrapAnnotation:  "true",
+		},
+		{
+			name:                         "annotation persists but DCGM label removed when DCGM pod deleted",
+			requireDCGMReadyForBootstrap: true,
+			dcgmPodReady:                 true,
+			existingBootstrapAnnotation:  "",
+			existingDCGMVersionLabel:     "4.x",
+			deletePodAfterLabelSet:       true,
+			expectedDCGMLabel:            "",
+			expectedBootstrapAnnotation:  "true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			testEnv := envtest.Environment{}
+			cfg, err := testEnv.Start()
+			require.NoError(t, err, "failed to setup envtest")
+			defer func() { _ = testEnv.Stop() }()
+
+			kubeClient, err := kubernetes.NewForConfig(cfg)
+			require.NoError(t, err, "failed to create K8s client")
+
+			ns, err := kubeClient.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "gpu-operator"},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err, "failed to create namespace")
+
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-node",
+					Labels:      make(map[string]string),
+					Annotations: make(map[string]string),
+				},
+			}
+			if tt.existingBootstrapAnnotation != "" {
+				node.Annotations[DCGMBootstrapCompletedAnnotation] = tt.existingBootstrapAnnotation
+			}
+			if tt.existingDCGMVersionLabel != "" {
+				node.Labels[DCGMVersionLabel] = tt.existingDCGMVersionLabel
+			}
+
+			_, err = kubeClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+			require.NoError(t, err, "failed to create node")
+
+			labeler, err := NewLabeler(kubeClient, time.Minute, "nvidia-dcgm", "nvidia-driver-daemonset",
+				"nvidia-driver-installer", "", false, devicecounts.Config{})
+			require.NoError(t, err, "failed to create labeler")
+			labeler.requireDCGMReadyForBootstrap = tt.requireDCGMReadyForBootstrap
+
+			labelerCtx, labelerCancel := context.WithCancel(ctx)
+			defer labelerCancel()
+
+			go func() { _ = labeler.Run(labelerCtx) }()
+
+			require.Eventually(t, func() bool {
+				return labeler.allInformersSynced()
+			}, 10*time.Second, 100*time.Millisecond, "informers did not sync")
+
+			dcgmPodStatus := corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				},
+			}
+			if tt.dcgmPodReady {
+				dcgmPodStatus = corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+					},
+				}
+			}
+
+			dcgmPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "dcgm-pod",
+					Labels: map[string]string{"app": "nvidia-dcgm"},
+				},
+				Spec: corev1.PodSpec{
+					NodeName: "test-node",
+					Containers: []corev1.Container{
+						{Name: "dcgm", Image: "nvcr.io/nvidia/dcgm:4.1.0"},
+					},
+				},
+			}
+
+			po, err := kubeClient.CoreV1().Pods(ns.Name).Create(ctx, dcgmPod, metav1.CreateOptions{})
+			require.NoError(t, err, "failed to create dcgm pod")
+			po.Status = dcgmPodStatus
+			_, err = kubeClient.CoreV1().Pods(ns.Name).UpdateStatus(ctx, po, metav1.UpdateOptions{})
+			require.NoError(t, err, "failed to update dcgm pod status")
+
+			if tt.deletePodAfterLabelSet {
+				require.Eventually(t, func() bool {
+					no, err := kubeClient.CoreV1().Nodes().Get(ctx, "test-node", metav1.GetOptions{})
+					if err != nil {
+						return false
+					}
+					return no.Labels[DCGMVersionLabel] != "" &&
+						no.Annotations[DCGMBootstrapCompletedAnnotation] != ""
+				}, 15*time.Second, 500*time.Millisecond, "dcgm label and annotation should be set before pod deletion")
+
+				var noGrace int64 = 0
+				err = kubeClient.CoreV1().Pods(ns.Name).Delete(ctx, dcgmPod.Name, metav1.DeleteOptions{GracePeriodSeconds: &noGrace})
+				require.NoError(t, err, "failed to delete dcgm pod")
+			}
+
+			require.Eventually(t, func() bool {
+				no, err := kubeClient.CoreV1().Nodes().Get(ctx, "test-node", metav1.GetOptions{})
+				if err != nil {
+					return false
+				}
+				dcgmLabel := no.Labels[DCGMVersionLabel]
+				annotation := no.Annotations[DCGMBootstrapCompletedAnnotation]
+				if dcgmLabel != tt.expectedDCGMLabel {
+					t.Logf("waiting for DCGM label: want=%q got=%q", tt.expectedDCGMLabel, dcgmLabel)
+					return false
+				}
+				if annotation != tt.expectedBootstrapAnnotation {
+					t.Logf("waiting for bootstrap annotation: want=%q got=%q", tt.expectedBootstrapAnnotation, annotation)
+					return false
+				}
+				return true
+			}, 15*time.Second, 500*time.Millisecond, "node labels/annotations not as expected")
 		})
 	}
 }
